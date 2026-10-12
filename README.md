@@ -81,10 +81,25 @@ Workers run a 3-thread pipeline so the GPU computes continuously: while the GPU 
 - NVIDIA GPU, sm_90+ (Hopper / Ada / Blackwell) — fp64 atomicAdd is hardware-native from sm_60 but fastest on sm_90+
 - CUDA Toolkit 12+, with `libcufft`
 - Python 3.10+ with `numpy`, `flask`
-- SSH key authentication from coordinator to all worker nodes
+- **Passwordless SSH** from the coordinator node to every worker node (see setup below)
 - Shared storage (NAS/NFS) mounted at the same path on all nodes
 
 Tested on 4× RTX 5070 Ti (Blackwell, sm_120) in WSL2 on Windows 11.
+
+### Setting up passwordless SSH
+
+The coordinator streams work to workers over SSH. Password prompts would block it, so key-based auth is required. Run this **once on the coordinator**:
+
+```bash
+ssh-keygen -t ed25519          # accept defaults; skip if you already have a key
+ssh-copy-id user@192.168.1.10  # repeat for each worker node IP
+ssh-copy-id user@192.168.1.11
+```
+
+Test that it works without a password prompt:
+```bash
+ssh user@192.168.1.10 echo ok
+```
 
 ---
 
@@ -108,8 +123,9 @@ nvcc -O3 -arch=sm_90 -o rh_worker_cuda rh_cuda.cu -lcufft -lpthread
 
 **1. Edit `rh_coordinator.py` — top section:**
 ```python
-NODES            = ["192.168.1.10", "192.168.1.11"]  # worker node IPs
-WORKERS_PER_NODE = 3                                  # workers per GPU (tune to VRAM)
+# Add or remove IPs freely — any number of nodes works (1 to N)
+NODES            = ["192.168.1.10", "192.168.1.11", "192.168.1.12"]
+WORKERS_PER_NODE = 3      # parallel workers per node; tune to your GPU's VRAM (see table below)
 WORK_DIR         = "/home/user/riemann-gpu"
 ```
 
