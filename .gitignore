@@ -1,0 +1,9 @@
+rh_worker_cuda
+libcufft.so.12
+coordinator.log
+dashboard.log
+__pycache__/
+*.pyc
+*.pyo
+results/
+*.o
