@@ -24,7 +24,7 @@ N(T) = ⌊θ(T)/π⌋ + 1
 
 proves (or disproves) that all zeros up to height T are accounted for on the line.
 
-### Computing Z(t) via NUFFT
+### Computing Z(t) via the Odlyzko-Schönhage algorithm (GPU NUFFT)
 
 The Riemann-Siegel formula expands Z(t) as:
 
@@ -35,7 +35,9 @@ Z(t) = 2 · Σ_{n=1}^{N} cos(θ(t) − t·ln n) / √n  +  C₀(t)
 
 For t ~ 4×10¹², N ≈ 800,000 terms evaluated at K = 50,000,000 grid points. Naïve cost: O(N·K) ≈ 4×10¹³ ops per chunk — infeasible even on GPU.
 
-Instead we recast it as a **Non-Uniform DFT**: sources at non-uniform frequencies ln(n)/(2π), targets on a uniform grid. The **NUFFT** (Kaiser-Bessel spreading → FFT → deconvolution) reduces cost to O((N+K) log K), making each chunk run in ~0.5 seconds on a single RTX 5070 Ti.
+The key insight from **Odlyzko & Schönhage (1988)** is that the main sum is a Fourier-type evaluation: each term n^{-it} = e^{-it ln n} places a source at non-uniform frequency ln(n)/(2π), and evaluating it at K equally-spaced t values is a **Non-Uniform DFT**. This reduces the cost from O(N·K) to O((N+K) log K).
+
+We implement this via the **NUFFT** (Kaiser-Bessel spreading → cuFFT → deconvolution), which is the standard modern realization of the Odlyzko-Schönhage idea. Each 100,000-second chunk runs in ~0.5 seconds on a single RTX 5070 Ti.
 
 ### Backlund verification (chunk-by-chunk)
 
