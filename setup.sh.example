@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# First-time cluster setup.
+#
+# 1. Copy this file:  cp setup.sh.example setup.sh
+# 2. Edit the variables below for your environment
+# 3. Run:            bash setup.sh
+#
+# setup.sh is gitignored — your IPs and credentials stay local.
+
+set -e
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# IP addresses of all worker nodes (coordinator can also be a worker)
+NODES=(192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13)
+
+# NAS / shared storage (must be accessible from all nodes at the same mount path)
+NAS_HOST=192.168.1.200   # IP of your NAS or file server
+NAS_SHARE=sharename      # SMB share name
+NAS_USER=yourusername    # SMB username
+NAS_PASS=yourpassword    # SMB password
+MOUNT=/mnt/math          # where the share will be mounted on every node
+
+# Path where the code lives (or will be copied to) on every node
+WORK_DIR=/home/youruser/riemann-gpu
+
+# ── Per-node installation ─────────────────────────────────────────────────────
+
+install_node() {
+    local host=$1
+    echo "=== Setting up $host ==="
+    ssh "$host" bash -s <<'REMOTE'
+set -e
+
+# WSL: make nvidia-smi / CUDA libs discoverable
+if [ -d /usr/lib/wsl/lib ] && ! echo "$PATH" | grep -q wsl; then
+    grep -q 'wsl/lib' ~/.bashrc 2>/dev/null || \
+        echo 'export PATH="/usr/lib/wsl/lib:$PATH"' >> ~/.bashrc
+    export PATH="/usr/lib/wsl/lib:$PATH"
+fi
+
+# System packages
+sudo apt-get update -qq
+sudo apt-get install -y --no-install-recommends \
+    python3-pip python3-dev build-essential \
+    cifs-utils smbclient \
+    git curl wget 2>&1 | grep -E '(Install|Unpacking|already)'
+
+# Python packages
+pip3 install --quiet --upgrade pip
+pip3 install --quiet numpy flask
+
+echo "  [ok] $HOSTNAME done"
+REMOTE
+}
+
+for node in "${NODES[@]}"; do
+    install_node "$node" &
+done
+wait
+echo "All nodes installed."
+
+# ── Mount NAS on all nodes ────────────────────────────────────────────────────
+
+mount_nas() {
+    local host=$1
+    echo "=== Mounting NAS on $host ==="
+    ssh "$host" bash -s <<REMOTE
+set -e
+sudo mkdir -p $MOUNT
+echo "username=$NAS_USER
+password=$NAS_PASS" | sudo tee /etc/.math_creds > /dev/null
+sudo chmod 600 /etc/.math_creds
+
+sudo umount $MOUNT 2>/dev/null || true
+sudo mount -t cifs //$NAS_HOST/$NAS_SHARE $MOUNT \
+    -o credentials=/etc/.math_creds,uid=\$(id -u),gid=\$(id -g),\
+file_mode=0664,dir_mode=0775,vers=3.0
+
+echo "  [ok] Mounted $NAS_HOST/$NAS_SHARE → $MOUNT"
+REMOTE
+}
+
+for node in "${NODES[@]}"; do
+    mount_nas "$node" &
+done
+wait
+
+# ── Create result directories on NAS ─────────────────────────────────────────
+
+echo "Creating NAS directory structure..."
+mkdir -p $MOUNT/rh/{queue,active,done,logs}
+echo "NAS ready."
+
+# ── Copy code to worker nodes ─────────────────────────────────────────────────
+
+for node in "${NODES[@]:1}"; do   # skip first node (coordinator) if code is already there
+    echo "Copying code to $node..."
+    ssh "$node" "mkdir -p $WORK_DIR"
+    scp -q "$WORK_DIR"/*.py "$WORK_DIR"/rh_worker_cuda "$node:$WORK_DIR/" 2>/dev/null || \
+        scp -q "$WORK_DIR"/*.py "$node:$WORK_DIR/"
+done
+
+echo ""
+echo "Setup complete."
+echo "Next: edit rh_coordinator.py and rh_dashboard.py with your NODES list, then:"
+echo "  screen -dmS rh_dash  bash -c 'python3 $WORK_DIR/rh_dashboard.py'"
+echo "  screen -dmS rh_coord bash -c 'python3 $WORK_DIR/rh_coordinator.py | tee coordinator.log'"
