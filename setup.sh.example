@@ -11,7 +11,8 @@ set -e
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# IP addresses of all worker nodes (coordinator can also be a worker)
+# IP addresses of all worker nodes — add as many or as few as you like (1 to N).
+# The coordinator can also be listed here to use its own GPU.
 NODES=(192.168.1.10 192.168.1.11 192.168.1.12 192.168.1.13)
 
 # NAS / shared storage (must be accessible from all nodes at the same mount path)
