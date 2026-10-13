@@ -137,17 +137,32 @@ NODE_HOST_MAP = {                          # hostname → IP for nvidia-smi
 }
 ```
 
-**3. Create the NAS config at `<mount>/rh/config.json`:**
+**3. Set the search range in `<mount>/rh/config.json`:**
+
+This file controls what region of the critical line is searched. Create or edit it directly:
+
 ```json
 {
-  "T_start":  3000000000000.0,
-  "T_end":    4000000000000.0,
-  "dt":       0.002,
+  "T_start":  14.0,
+  "T_end":    1000000.0,
   "chunk_dt": 100000.0
 }
 ```
 
-Or run `python3 -c "import nas_fs as nas; nas.ensure_default_config()"` to create it with defaults.
+| Field | Meaning | Notes |
+|---|---|---|
+| `T_start` | Lower bound of search (imaginary part of s) | 14.134 is the first known zero; start at 14 to cover everything |
+| `T_end` | Upper bound | Set to whatever height you want to reach |
+| `chunk_dt` | Width of each work unit in t-seconds | 100,000 is a good default (~0.5 sec/chunk on RTX 5070 Ti) |
+
+The coordinator splits `[T_start, T_end]` into chunks of `chunk_dt` and distributes them across the cluster. It resumes automatically on restart — already-completed chunks are skipped.
+
+**Where to start?** The first ~10¹³ zeros have been rigorously verified by academic groups. To push into new territory, set `T_start` to match the highest verified value in the literature (Platt & Trudgian 2021 reached t ≈ 3×10¹²; our run extended to 4×10¹²). To re-verify a known range as a sanity check, any interval works.
+
+Or generate a default config automatically:
+```bash
+python3 -c "import nas_fs as nas; nas.ensure_default_config()"
+```
 
 **4. First-time cluster setup:**
 ```bash
