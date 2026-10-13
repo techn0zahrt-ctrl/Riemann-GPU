@@ -1,3 +1,4 @@
+setup.sh
 rh_worker_cuda
 libcufft.so.12
 coordinator.log
