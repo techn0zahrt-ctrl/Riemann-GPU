@@ -48,11 +48,20 @@ _chunks_err:  int = 0
 _chunks_done: int = 0  # only chunks completed THIS coordinator run
 
 
+CFG: dict = {}   # active run config, set in main()
+
+
 # ── Work queue ────────────────────────────────────────────────────────────────
 
 def build_queue(config) -> int:
-    done_ids   = {p.stem for p in nas.rh_path("done").iterdir()   if p.suffix == ".json"}
-    active_ids = {p.stem for p in nas.rh_path("active").iterdir() if p.suffix == ".json"}
+    done_ids   = {p.stem for p in nas.done_dir(config).iterdir()   if p.suffix == ".json"}
+    active_ids = {p.stem for p in nas.active_dir(config).iterdir() if p.suffix == ".json"}
+    # Extra per-job fields understood by rh_worker_cuda
+    extra = {"out_dir":    str(nas.done_dir(config)),
+             "active_dir": str(nas.active_dir(config))}
+    if config.get("stats"):
+        extra["stats"] = True
+        extra["close_thresh"] = float(config.get("close_thresh", 0.05))
     _pending.clear()
     t = config["T_start"]
     idx = 0
@@ -61,7 +70,7 @@ def build_queue(config) -> int:
         cid   = f"chunk_{idx:07d}"
         if cid not in done_ids and cid not in active_ids:
             _pending.append({"chunk_id": cid, "t_start": t,
-                             "t_end": t_end, "dt": config["dt"]})
+                             "t_end": t_end, "dt": config.get("dt", 0.002), **extra})
         t += config["chunk_dt"]
         idx += 1
     print(f"Queue: {len(_pending)} pending  |  {len(done_ids)} done  {len(active_ids)} active")
@@ -116,13 +125,13 @@ class WorkerSlot:
                 return
             if self.proc is None or self.proc.poll() is not None:
                 self.proc = self._spawn()
-            nas.write_json(nas.rh_path("active", f"{chunk['chunk_id']}.json"), chunk)
+            nas.write_json(nas.active_dir(CFG) / f"{chunk['chunk_id']}.json", chunk)
             try:
                 self.proc.stdin.write((json.dumps(chunk) + "\n").encode())
                 self.proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 _pending.appendleft(chunk)
-                nas.rh_path("active", f"{chunk['chunk_id']}.json").unlink(missing_ok=True)
+                (nas.active_dir(CFG) / f"{chunk['chunk_id']}.json").unlink(missing_ok=True)
                 with _lock:
                     _inflight.pop(chunk["chunk_id"], None)
                 with self._lock:
@@ -205,7 +214,7 @@ def reclaim_stale():
     if now - _last_reclaim < 300:  # only every 5 minutes — NAS iterdir is slow
         return
     _last_reclaim = now
-    for path in list(nas.rh_path("active").iterdir()):
+    for path in list(nas.active_dir(CFG).iterdir()):
         if path.suffix != ".json":
             continue
         try:
@@ -231,7 +240,7 @@ def write_summary(config, slots, n_done_start: int):
     n_active = sum(1 for s in slots if not s.is_free())
     t_cover  = config["T_start"] + n_done * config["chunk_dt"]
 
-    nas.write_json(nas.rh_path("summary.json"), {
+    nas.write_json(nas.run_root(config) / "summary.json", {
         "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "zeros_verified": _zeros_total,
         "coverage_t":     t_cover,
@@ -258,9 +267,12 @@ def main():
     if not nas.nas_status():
         sys.exit("NAS not mounted at /mnt/math")
 
-    nas.ensure_rh_dirs()
     nas.ensure_default_config()
     config = nas.read_config()
+    CFG.update(config)
+    nas.ensure_rh_dirs(config)
+    print(f"  Run dir : {nas.run_root(config)}"
+          f"{'  (zero statistics ON)' if config.get('stats') else ''}")
 
     print(f"  T ∈ [{config['T_start']:.4e}, {config['T_end']:.4e}]  chunk_dt={config['chunk_dt']}")
     expected = backlund_count(config["T_end"]) - backlund_count(config["T_start"])

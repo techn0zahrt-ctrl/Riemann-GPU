@@ -46,6 +46,8 @@
 #include <condition_variable>
 #include <queue>
 
+#include "rh_stats.h"
+
 // ─── tunables ──────────────────────────────────────────────────────────────
 
 #define THREADS    256
@@ -421,7 +423,8 @@ static void compute_Z_nufft(
 
 // ─── sign changes ──────────────────────────────────────────────────────────
 
-static std::vector<int> find_sign_changes(const double* Z, int n) {
+static std::vector<int> find_sign_changes(const double* Z, int n,
+                                          long long* dropped = nullptr) {
     std::vector<int> raw;
     raw.reserve(n / 4);
     for (int i = 0; i < n - 1; i++)
@@ -444,14 +447,17 @@ static std::vector<int> find_sign_changes(const double* Z, int n) {
 
     std::vector<int> out;
     out.reserve(raw.size());
+    long long nd = 0;
     for (size_t k = 0; k < raw.size(); ) {
         if (k + 1 < raw.size() && raw[k+1] - raw[k] <= GAP_MAX) {
             k += 2;  // skip pair → false dip
+            nd++;
         } else {
             out.push_back(raw[k]);
             ++k;
         }
     }
+    if (dropped) *dropped = nd;
     return out;
 }
 
@@ -517,6 +523,10 @@ struct ChunkResult {
     bool        backlund_ok;
     double      wall_seconds;
     std::vector<double> zero_positions;  // only populated on Backlund mismatch
+    std::string out_dir;                 // where the per-chunk JSON goes
+    std::string active_dir;              // where the coordinator's in-flight marker lives
+    bool        want_stats = false;
+    ZeroStats   stats;
 };
 
 // Phase 1: GPU compute + sign counting + Backlund check.  No I/O — pure compute.
@@ -717,7 +727,8 @@ static ChunkResult compute_chunk(const std::string& job) {
     }
 
     // Count sign changes (positions only needed on Backlund mismatch)
-    auto idxs = find_sign_changes(Zg.data(), K);
+    long long n_dips = 0;
+    auto idxs = find_sign_changes(Zg.data(), K, &n_dips);
     long long nf = (long long)idxs.size();
 
     fprintf(stderr,"  zeros=%lld  (pos acc=%.4f)\n", nf, h/2.0);
@@ -729,7 +740,6 @@ static ChunkResult compute_chunk(const std::string& job) {
     fprintf(stderr,"  Backlund: found=%lld expected=%lld  %s\n",
             nf, ne, ok?"ALL_ON_CRITICAL_LINE":"MISMATCH");
 
-    double wall_s = now_s() - t_wall;
 
     ChunkResult r;
     r.chunk_id          = chunk_id;
@@ -740,7 +750,17 @@ static ChunkResult compute_chunk(const std::string& job) {
     r.zeros_found       = nf;
     r.backlund_expected = ne;
     r.backlund_ok       = ok;
-    r.wall_seconds      = wall_s;
+    r.out_dir           = jstr(job, "out_dir");
+    if (r.out_dir.empty()) r.out_dir = "/mnt/math/rh/done";
+    r.active_dir        = jstr(job, "active_dir");
+    if (r.active_dir.empty()) r.active_dir = "/mnt/math/rh/active";
+    r.want_stats        = (jstr(job, "stats") == "true");
+    if (r.want_stats) {
+        double ct = jdbl(job, "close_thresh");
+        if (ct <= 0.0) ct = 0.05;
+        r.stats = compute_zero_stats(Zg.data(), K, t0, h, idxs, n_dips, ct);
+    }
+    r.wall_seconds      = now_s() - t_wall;
     if (!ok) {
         r.zero_positions.resize(idxs.size());
         for (size_t i = 0; i < idxs.size(); i++)
@@ -753,7 +773,7 @@ static ChunkResult compute_chunk(const std::string& job) {
 // Called after all GPU work in a batch is complete so NAS I/O never stalls the GPU.
 static void write_chunk_result(const ChunkResult& r) {
     char nas_path[512];
-    snprintf(nas_path, sizeof(nas_path), "/mnt/math/rh/done/%s.json", r.chunk_id.c_str());
+    snprintf(nas_path, sizeof(nas_path), "%s/%s.json", r.out_dir.c_str(), r.chunk_id.c_str());
     FILE* fnas = fopen(nas_path, "w");
     if (fnas) {
         fprintf(fnas,"{\n");
@@ -767,6 +787,22 @@ static void write_chunk_result(const ChunkResult& r) {
         fprintf(fnas,"  \"backlund_ok\": %s,\n",    r.backlund_ok?"true":"false");
         fprintf(fnas,"  \"wall_seconds\": %.3f,\n", r.wall_seconds);
         fprintf(fnas,"  \"gpu_used\": true");
+        if (r.want_stats) {
+            const ZeroStats& s = r.stats;
+            fprintf(fnas,",\n  \"stats\": {\"sp_bin\": %g, \"pc_bin\": %g, "
+                         "\"n_spacings\": %lld, \"spacing_overflow\": %lld, "
+                         "\"pc_base\": %lld, \"dips_dropped\": %lld,\n",
+                    SP_BIN, PC_BIN, s.n_spacings, s.spacing_overflow, s.pc_base, s.dips_dropped);
+            fprintf(fnas,"    \"spacing_hist\": [");
+            for (int b = 0; b < SP_BINS; b++) fprintf(fnas,"%s%lld", b?",":"", s.spacing_hist[b]);
+            fprintf(fnas,"],\n    \"pc_hist\": [");
+            for (int b = 0; b < PC_BINS; b++) fprintf(fnas,"%s%lld", b?",":"", s.pc_hist[b]);
+            fprintf(fnas,"],\n    \"close_pairs\": [");
+            for (size_t i = 0; i < s.close_pairs.size(); i++)
+                fprintf(fnas,"%s[%.4f,%.4f,%.6f]", i?",":"",
+                        s.close_pairs[i].ta, s.close_pairs[i].tb, s.close_pairs[i].gap);
+            fprintf(fnas,"]}");
+        }
         if (!r.backlund_ok) {
             fprintf(fnas,",\n  \"zeros\": [\n");
             for (size_t i = 0; i < r.zero_positions.size(); i++)
@@ -778,7 +814,7 @@ static void write_chunk_result(const ChunkResult& r) {
         }
         fclose(fnas);
         char act[512];
-        snprintf(act, sizeof(act), "/mnt/math/rh/active/%s.json", r.chunk_id.c_str());
+        snprintf(act, sizeof(act), "%s/%s.json", r.active_dir.c_str(), r.chunk_id.c_str());
         remove(act);
     }
 }
@@ -859,7 +895,7 @@ static void process_batch(const std::string& line) {
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
-        printf("rh_worker_cuda (NUFFT, centred band)\n");
+        printf("rh_worker_cuda (NUFFT, centred band, stats mode)\n");
         return 0;
     }
     // Pre-allocate GPU buffers and warm up cuFFT JIT.

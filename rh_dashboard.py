@@ -85,7 +85,7 @@ def _update_cache():
         config = {}; chunk_dt = 5000.0; total_chunks = 10530
 
     try:
-        summary = nas.read_json(nas.rh_path("summary.json"))
+        summary = nas.read_json(nas.run_root() / "summary.json")
     except Exception:
         summary = {}
 
@@ -101,7 +101,7 @@ def _update_cache():
     # os.listdir() is fast (name-only, no file reads) even for 10M+ entries
     if not coord_ok:
         try:
-            actual_done = sum(1 for f in os.listdir(str(nas.rh_path("done"))) if f.endswith(".json"))
+            actual_done = sum(1 for f in os.listdir(str(nas.done_dir())) if f.endswith(".json"))
             if actual_done > chunks_done:
                 chunks_done = actual_done
                 summary = dict(summary)
@@ -191,7 +191,7 @@ def _update_cache():
     active_chunks = []
     node_active: dict = defaultdict(int)
     try:
-        for name in os.listdir(str(nas.rh_path("active"))):
+        for name in os.listdir(str(nas.active_dir())):
             if not name.endswith(".json"):
                 continue
             active_chunks.append({"chunk_id": Path(name).stem, "node_ip": None,

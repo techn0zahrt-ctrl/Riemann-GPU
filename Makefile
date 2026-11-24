@@ -21,7 +21,7 @@ LDFLAGS := -lm -lcufft -cudart static -Xlinker '-rpath,$$ORIGIN'
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
+$(TARGET): $(SRC) rh_stats.h
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "Built: $@"
 	@./$@ --version 2>/dev/null || true
@@ -34,7 +34,7 @@ install: $(TARGET)
 	@cp $(CUDA_LIBDIR)/libcufft.so.12 . 2>/dev/null || true
 	@for node in 192.168.100.10 192.168.100.11 192.168.100.12; do \
 	    echo "=== $$node ==="; \
-	    scp -q $(TARGET) libcufft.so.12 rh_worker.py rh_core.py nas_fs.py $$node:/home/techno/math/ && \
+	    scp -q $(TARGET) libcufft.so.12 rh_worker.py rh_core.py nas_fs.py rh_stats.py rh_pairs.py rh_check.py $$node:/home/techno/math/ && \
 	    ssh $$node "chmod +x /home/techno/math/$(TARGET)" && echo "  deployed"; \
 	done
 

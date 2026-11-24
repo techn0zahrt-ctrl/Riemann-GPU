@@ -24,9 +24,35 @@ def rh_path(*parts) -> Path:
     return RH_ROOT.joinpath(*parts)
 
 
-def ensure_rh_dirs():
-    for d in ("queue", "active", "done", "logs"):
+def run_root(cfg: dict | None = None) -> Path:
+    """Directory holding done/, active/ and summary.json for the current run.
+
+    Legacy configs (no "run" key) use /mnt/math/rh directly, so the original
+    10M-chunk verification run keeps working.  A config with "run": "<name>"
+    puts everything under /mnt/math/rh/runs/<name>/ so runs never collide.
+    """
+    if cfg is None:
+        try:
+            cfg = read_config()
+        except (FileNotFoundError, ValueError):
+            cfg = {}
+    run = cfg.get("run")
+    return rh_path("runs", run) if run else RH_ROOT
+
+
+def done_dir(cfg: dict | None = None) -> Path:
+    return run_root(cfg) / "done"
+
+
+def active_dir(cfg: dict | None = None) -> Path:
+    return run_root(cfg) / "active"
+
+
+def ensure_rh_dirs(cfg: dict | None = None):
+    for d in ("queue", "logs"):
         rh_path(d).mkdir(parents=True, exist_ok=True)
+    done_dir(cfg).mkdir(parents=True, exist_ok=True)
+    active_dir(cfg).mkdir(parents=True, exist_ok=True)
 
 
 def read_config() -> dict:

@@ -1,0 +1,9 @@
+{
+  "run":          "stats_3e12",
+  "T_start":      3000000000000.0,
+  "T_end":        3010000000000.0,
+  "chunk_dt":     100000.0,
+  "dt":           0.002,
+  "stats":        true,
+  "close_thresh": 0.05
+}
