@@ -10,8 +10,10 @@ SRC     := rh_cuda.cu
 ARCH    := -gencode arch=compute_120,code=sm_120
 
 # -O3 for host code; --use_fast_math only for float — we keep FP64 exact
+# -march=haswell (AVX2/FMA), NOT native: the binary is built on the coordinator
+# (i9-11900KF, AVX-512) but runs on i5-10400F workers without AVX-512 → SIGILL.
 NVCCFLAGS := $(ARCH) -O3 -std=c++17 \
-             -Xcompiler "-O3 -march=native" \
+             -Xcompiler "-O3 -march=haswell" \
              --extra-device-vectorization \
              -lineinfo
 
@@ -21,7 +23,7 @@ LDFLAGS := -lm -lcufft -cudart static -Xlinker '-rpath,$$ORIGIN'
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) rh_stats.h
+$(TARGET): $(SRC) rh_stats.h Makefile
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "Built: $@"
 	@./$@ --version 2>/dev/null || true
