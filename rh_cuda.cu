@@ -123,6 +123,7 @@ double kb_window_dev(double dx, double beta, double I0b_inv) {
 __global__ void nufft_spread_kernel(
     double t0, double h, int N_max, int M,
     double beta, double I0b_inv,
+    const double* __restrict__ logn_corr,     // [n-1]: logl(n) − log(n)
     cufftDoubleComplex* __restrict__ grid_cx
 ) {
     int n = (int)(blockIdx.x*(unsigned)blockDim.x + threadIdx.x) + 1;
@@ -141,7 +142,8 @@ __global__ void nufft_spread_kernel(
     double ang   = -ph_hi;
     double alo   = -ph_lo;
     double k2pi  = rint(ang * INV_2PI);
-    double r     = fma(-k2pi, TWO_PI_A, ang) - k2pi * TWO_PI_B + alo;
+    double r     = fma(-k2pi, TWO_PI_A, ang) - k2pi * TWO_PI_B + alo
+                 - t0 * logn_corr[n - 1];      // ln n error ~1e-15 × t0 ~ 3e-3 rad otherwise
     double a_re  = isqn * cos(r);
     double a_im  = isqn * sin(r);
 
@@ -167,19 +169,29 @@ __global__ void nufft_spread_kernel(
 // Φ̂[j] (KB window DFT) computed on-the-fly — symmetric window → purely real.
 // Precomputed phi_vals[0..W] passed as constant array for speed.
 
+// Output j corresponds to frequency k = j − jc, i.e. t_j = tc + k·h.  Centring the
+// band (|k| ≤ K/2 ≈ 0.19·M) keeps every output inside the accurate range of the
+// KB window; the old uncentred layout (k = 0..K ≈ 0.37·M) lost accuracy toward the
+// end of each chunk (|ΔZ| up to ~0.14 at k ≈ K).
+//
+// θ(t_j) = θ(tc) + θ'(tc)·τ + θ''(tc)·τ²/2,  τ = k·h, with θ(tc) mod 2π from long double
+// on the host.  Evaluating θ(t) directly in double at t ~ 3e12 (θ ~ 4e13) costs ~1e-2 rad.
 __global__ void nufft_finalize_kernel(
     const cufftDoubleComplex* __restrict__ G,
     const double*             __restrict__ phi_vals,   // [NUFFT_W+1] = φ(-W/2..W/2)
-    int K, int M,
-    double t0, double h,
+    int K, int M, int jc,
+    double tc, double h,
+    double th0, double th1, double th2,
     double* __restrict__ Z_out
 ) {
     int j = (int)(blockIdx.x*(unsigned)blockDim.x + threadIdx.x);
     if (j >= K) return;
+    int k  = j - jc;
+    int gi = (k < 0) ? k + M : k;
 
-    // Compute Φ̂[j] = Σ_{dw=-W/2}^{W/2} φ(dw)·cos(2π·j·dw/M)
+    // Compute Φ̂[k] = Σ_{dw=-W/2}^{W/2} φ(dw)·cos(2π·k·dw/M)
     double phi_hat = phi_vals[NUFFT_W/2];   // dw=0 contribution (cos(0)=1)
-    double angle0  = 2.0 * M_PI * j / M;
+    double angle0  = 2.0 * M_PI * k / M;
     #pragma unroll
     for (int dw = 1; dw <= NUFFT_W/2; dw++) {
         double pv = phi_vals[NUFFT_W/2 + dw];  // φ(dw) = φ(-dw) by symmetry
@@ -187,12 +199,13 @@ __global__ void nufft_finalize_kernel(
     }
 
     // Deconvolve: F(j) = G[j] / Φ̂[j]
-    double Fr = (phi_hat > 1e-30) ? G[j].x / phi_hat : 0.0;
-    double Fi = (phi_hat > 1e-30) ? G[j].y / phi_hat : 0.0;
+    double Fr = (phi_hat > 1e-30) ? G[gi].x / phi_hat : 0.0;
+    double Fi = (phi_hat > 1e-30) ? G[gi].y / phi_hat : 0.0;
 
     // Z(t_j) = 2·Re[e^{iθ}·F] + C₀
-    double t  = t0 + j * h;
-    double th = theta_dev(t);
+    double tau = k * h;
+    double t   = tc + tau;
+    double th  = th0 + tau * (th1 + 0.5 * th2 * tau);
     double Z  = 2.0 * (Fr * cos(th) - Fi * sin(th));
 
     // C₀ correction: (-1)^N * (t/2π)^{-1/4} * cos(2π(p²-p-1/16)) / cos(2πp)
@@ -351,6 +364,19 @@ static void compute_Z_nufft(
     int    N_max   = (int)sqrt(t0 / (2.0 * M_PI));  // RS floor at t_start (matches Python)
     ensure_nufft(K, h, N_max);
 
+    // Centre of the output band.  The grid is t_j = tc + (j − jc)·h; tc is whatever
+    // double t0 + jc·h rounds to, and is used consistently below.
+    int    jc = K / 2;
+    double tc = t0 + jc * h;
+    // θ(tc) mod 2π and derivatives, in long double (64-bit mantissa).
+    long double T   = tc;
+    long double thL = (T/2)*logl(T/(2*M_PIl)) - T/2 - M_PIl/8
+                    + 1/(48*T) + 7/(5760*T*T*T);
+    long double twopi = 2*M_PIl;
+    double th0 = (double)(thL - twopi * floorl(thL / twopi));
+    double th1 = (double)(0.5L*logl(T/(2*M_PIl)) - 1/(48*T*T));
+    double th2 = (double)(1/(2*T));
+
     int    M       = nufft_M_cur;
     double I0b_inv = 1.0 / bessel_I0_host(NUFFT_BETA);
 
@@ -362,8 +388,8 @@ static void compute_Z_nufft(
         int blk = THREADS;
         int grd = (N_max + blk - 1) / blk;
         nufft_spread_kernel<<<grd, blk>>>(
-            t0, h, N_max, M, NUFFT_BETA, I0b_inv,
-            d_grid_cx);
+            tc, h, N_max, M, NUFFT_BETA, I0b_inv,
+            d_logn_corr, d_grid_cx);
     }
 
     // Phase 2: FFT
@@ -373,12 +399,24 @@ static void compute_Z_nufft(
     {
         int blk = THREADS, grd = (K + blk - 1) / blk;
         nufft_finalize_kernel<<<grd, blk>>>(
-            d_grid_cx, d_phi_vals, K, M, t0, h, d_Z_nufft);
+            d_grid_cx, d_phi_vals, K, M, jc, tc, h, th0, th1, th2, d_Z_nufft);
     }
 
     cudaDeviceSynchronize();
     cudaMemcpy(Z_host, d_Z_nufft, (size_t)K * sizeof(double),
                cudaMemcpyDeviceToHost);
+
+    // RH_DUMP=<file>: write tc, jc, h and Z at ~200 indices for validation (rh_check.py)
+    if (const char* dump = getenv("RH_DUMP")) {
+        if (FILE* f = fopen(dump, "w")) {
+            fprintf(f, "%.17g %d %.17g\n", tc, jc, h);
+            for (int q = 0; q < 200; q++) {
+                int j = (int)((long long)q * (K - 1) / 199);
+                fprintf(f, "%d %.17g\n", j, Z_host[j]);
+            }
+            fclose(f);
+        }
+    }
 }
 
 // ─── sign changes ──────────────────────────────────────────────────────────
@@ -510,7 +548,9 @@ static ChunkResult compute_chunk(const std::string& job) {
     fprintf(stderr,"  scan %.3fs  K=%d  pts/s=%.0f\n",
             scan_s, K, K/(scan_s+1e-9));
 
-    // Diagnostic: compare NUFFT F(0) with direct GPU sum, then check first 200 Z values
+    // Diagnostic (legacy): compares against a double-precision direct sum indexed from t0.
+    // Since the output band is now centred on tc = t0 + (K/2)·h, the F(0) line refers to
+    // the uncentred layout and is not meaningful; use RH_DUMP + rh_check.py (mpmath) instead.
     if (getenv("RH_DIAG")) {
         int N_max_d = (int)sqrt(t0 / (2.0 * M_PI)) + 2;
         // Direct sum F(0) on GPU
@@ -817,7 +857,11 @@ static void process_batch(const std::string& line) {
     fflush(stdout);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--version") {
+        printf("rh_worker_cuda (NUFFT, centred band)\n");
+        return 0;
+    }
     // Pre-allocate GPU buffers and warm up cuFFT JIT.
     {
         int K_w = 50000002;

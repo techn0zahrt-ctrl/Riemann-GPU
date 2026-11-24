@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rh_core import (
     Z_batch, find_sign_changes, batch_bisect_zeros,
-    backlund_count, best_xp, gpu_available
+    backlund_count, best_xp, gpu_available, Z_scalar_mpmath
 )
 import nas_fs as nas
 

@@ -172,6 +172,7 @@ def bisect_zero(t_lo, t_hi, Z_lo=None, Z_hi=None, tol=1e-11, max_iter=60):
             t_hi, Z_hi = t_mid, Z_mid
         else:
             t_lo, Z_lo = t_mid, Z_mid
+    return (t_lo + t_hi) / 2.0
 
 
 def batch_bisect_zeros(sign_change_idxs, t_vals, Z_vals,
@@ -211,8 +212,6 @@ def batch_bisect_zeros(sign_change_idxs, t_vals, Z_vals,
         Z_lo  = np.where(~left, Z_mid, Z_lo)
 
     return list((t_lo + t_hi) / 2.0)
-
-    return (t_lo + t_hi) / 2.0
 
 
 # ── Backlund zero count ───────────────────────────────────────────────────────
