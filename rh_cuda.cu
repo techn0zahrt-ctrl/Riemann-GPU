@@ -537,9 +537,15 @@ static void host_sign_changes(const double* Z, int n, double h,
 }
 
 // Returns positions (into raw) of the sign changes kept after dip filtering.
+// dropped_at (optional) receives the raw positions k of each dropped pair (k, k+1).
 static std::vector<size_t> filter_dips(const std::vector<int>& raw,
-                                       long long* dropped = nullptr) {
-    // Remove narrow sign-change pairs caused by numerical false dips.
+                                       long long* dropped = nullptr,
+                                       std::vector<size_t>* dropped_at = nullptr) {
+    // Remove narrow sign-change pairs (≤ GAP_MAX grid steps apart).  Since the Nov 2026
+    // accuracy fixes these are ~4 per 50M-point chunk and are mostly GENUINE close zero
+    // pairs (the best Lehmer candidates) plus occasional near-misses where |Z| < ~2e-3;
+    // their positions are recorded as "dip_pairs" so rh_pairs.py can tell which is which.
+    // Original rationale (pre-fix, when they were ~5,700 per chunk of numerical noise):
     // A near-miss Z minimum (Z_true ≈ |ε| ≈ 0.005) at t_j can push Z_NUFFT
     // below zero for 1-2 grid steps, creating sign changes at (j-1,j) and
     // (j+k-1, j+k) for k=1 (1-step) or k=2 (2-step dip).  These appear in
@@ -558,7 +564,8 @@ static std::vector<size_t> filter_dips(const std::vector<int>& raw,
     long long nd = 0;
     for (size_t k = 0; k < raw.size(); ) {
         if (k + 1 < raw.size() && raw[k+1] - raw[k] <= GAP_MAX) {
-            k += 2;  // skip pair → false dip
+            if (dropped_at) dropped_at->push_back(k);
+            k += 2;  // skip pair
             nd++;
         } else {
             out.push_back(k);
@@ -849,7 +856,8 @@ static ChunkResult compute_chunk(const std::string& job) {
         host_sign_changes(Zg.data(), K, h, raw, raw_off);
     }
     long long n_dips = 0;
-    std::vector<size_t> keep = filter_dips(raw, &n_dips);
+    std::vector<size_t> dip_at;
+    std::vector<size_t> keep = filter_dips(raw, &n_dips, &dip_at);
     std::vector<int>    idxs(keep.size());
     std::vector<double> offs(keep.size());
     for (size_t k = 0; k < keep.size(); k++) { idxs[k] = raw[keep[k]]; offs[k] = raw_off[keep[k]]; }
@@ -883,6 +891,10 @@ static ChunkResult compute_chunk(const std::string& job) {
         double ct = jdbl(job, "close_thresh");
         if (ct <= 0.0) ct = 0.05;
         r.stats = compute_zero_stats_offsets(offs, K, t0, h, n_dips, ct);
+        const double rho = zero_density(t0 + 0.5 * K * h);
+        for (size_t k : dip_at)
+            r.stats.dip_pairs.push_back({t0 + raw_off[k], t0 + raw_off[k + 1],
+                                         (raw_off[k + 1] - raw_off[k]) * rho});
     }
     r.wall_seconds      = now_s() - t_wall;
     if (!ok) {
@@ -896,9 +908,12 @@ static ChunkResult compute_chunk(const std::string& job) {
 // Phase 2: write result to NAS done/ and remove active/ marker.
 // Called after all GPU work in a batch is complete so NAS I/O never stalls the GPU.
 static void write_chunk_result(const ChunkResult& r) {
-    char nas_path[512];
+    // Write to <id>.json.tmp, then rename: readers (coordinator, rh_stats.py) only look
+    // at *.json, so they never see a half-written file.
+    char nas_path[512], tmp_path[520];
     snprintf(nas_path, sizeof(nas_path), "%s/%s.json", r.out_dir.c_str(), r.chunk_id.c_str());
-    FILE* fnas = fopen(nas_path, "w");
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", nas_path);
+    FILE* fnas = fopen(tmp_path, "w");
     if (fnas) {
         fprintf(fnas,"{\n");
         fprintf(fnas,"  \"chunk_id\": \"%s\",\n",  r.chunk_id.c_str());
@@ -925,6 +940,10 @@ static void write_chunk_result(const ChunkResult& r) {
             for (size_t i = 0; i < s.close_pairs.size(); i++)
                 fprintf(fnas,"%s[%.4f,%.4f,%.6f]", i?",":"",
                         s.close_pairs[i].ta, s.close_pairs[i].tb, s.close_pairs[i].gap);
+            fprintf(fnas,"],\n    \"dip_pairs\": [");
+            for (size_t i = 0; i < s.dip_pairs.size(); i++)
+                fprintf(fnas,"%s[%.4f,%.4f,%.6f]", i?",":"",
+                        s.dip_pairs[i].ta, s.dip_pairs[i].tb, s.dip_pairs[i].gap);
             fprintf(fnas,"]}");
         }
         if (!r.backlund_ok) {
@@ -936,7 +955,12 @@ static void write_chunk_result(const ChunkResult& r) {
         } else {
             fprintf(fnas,"\n}\n");
         }
-        fclose(fnas);
+        bool ok_w = (fclose(fnas) == 0);
+        if (!ok_w || rename(tmp_path, nas_path) != 0) {
+            fprintf(stderr, "[write] failed to finalise %s\n", nas_path);
+            remove(tmp_path);
+            return;            // keep the active marker: the chunk gets reclaimed
+        }
         char act[512];
         snprintf(act, sizeof(act), "%s/%s.json", r.active_dir.c_str(), r.chunk_id.c_str());
         remove(act);

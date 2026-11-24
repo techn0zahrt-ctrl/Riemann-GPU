@@ -32,6 +32,7 @@ struct ZeroStats {
     long long              pc_base = 0;        // zeros used as the left point of pairs
     long long              dips_dropped = 0;   // sign-change pairs removed as numerical dips
     std::vector<ClosePair> close_pairs;
+    std::vector<ClosePair> dip_pairs;          // pairs removed by the dip filter (gap ≤ 2h)
 };
 
 static inline double zero_density(double t) {

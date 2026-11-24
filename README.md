@@ -93,17 +93,15 @@ python3 rh_pairs.py --demo                           # reproduces Lehmer's 1956 
 
 `rh_stats.py` writes per-bin CSVs (empirical, GUE/Gaudin or Montgomery reference, Poisson error, z-score), a text report, and the smallest-gap list. The exact GUE spacing density is computed as a Fredholm determinant of the sine kernel (Bornemann's method), not with the Wigner surmise.
 
-`rh_pairs.py` re-evaluates Z with `mpmath.siegelz` (30 digits, about 1.8 s per evaluation at t ≈ 3×10¹²). It confirms two sign changes, refines both zeros to about 10⁻¹², and reports max |Z| between them. A small max |Z| marks a strong Lehmer pair.
+`rh_pairs.py` re-evaluates Z with `mpmath.siegelz` (30 digits, about 4 s per evaluation at t ≈ 3×10¹²; about 15 s of wall time per pair on 16 cores). It scans at least ±0.005 around the GPU position, confirms two sign changes, refines both zeros to about 10⁻¹², and reports max |Z| between them. A small max |Z| marks a strong Lehmer pair. `NEAR_MISS` means Z came close to zero without crossing, and the GPU (error up to about 2×10⁻³ in rare spots) mistook that for two zeros.
 
 **Validating the GPU values.** `RH_DUMP=<file>` makes the worker dump Z at 200 points spread evenly across a chunk. `python3 rh_check.py <file>` compares them with `mpmath.siegelz`. At t = 3×10¹² the maximum error is 5×10⁻⁴ across the whole chunk.
 
-**First results (Nov 2026, 20 chunks, 8.56M zeros at t = 3×10¹²):**
-- Found minus expected is about −10 zeros per chunk. That matches the roughly 4.5 unresolvable close pairs dropped per chunk (2 zeros each).
-- Spacing CDF Kolmogorov distance to GUE is 3.3×10⁻³. Compared with GUE there's a deficit near s ≈ 0.25–0.5 and s ≈ 2 and an excess near s ≈ 1: the distribution is slightly narrower than GUE, the shape the finite-height (Bogomolny–Keating) theory leads you to expect. It hasn't been compared with their formula yet.
-- The 8 closest candidates were all confirmed by mpmath as true pairs, with unfolded gaps of 0.016–0.023. The tightest have max |Z| ≈ 3×10⁻⁴ between the zeros.
-- Unfolded gaps from the GPU are biased low for very close pairs (e.g. 0.018 reported vs 0.023 true), because linear interpolation fails where Z is nearly parabolic. Use `rh_pairs.py` values for those.
+Results of the first full run are in [Results](#results).
 
-**Resolution limits.** With h = 0.002 the grid can't separate zeros closer than about 2h, which is δ ≈ 0.017 near 3×10¹². The worker removes those as possible numerical dips and only reports how many (`dips_dropped`). The first spacing bin is therefore biased low, and the very closest pairs have to be found another way. For example, the Backlund-mismatch chunks of the October run, which store zero positions, are where missed pairs show up as unusually large gaps.
+**Resolution limits.**
+- **Pairs closer than about 2h.** With h = 0.002 the grid can't separate zeros closer than about 2h (δ ≈ 0.017 near 3×10¹²). The worker removes such sign-change pairs from the statistics (`dips_dropped`, about 4.4 per chunk) but records their positions as `dip_pairs`, and `rh_stats.py` writes them to `<out>_dip_pairs.csv`. A 16-pair mpmath check found all 16 to be genuine close pairs, so these are the best Lehmer candidates, not noise. The first spacing bin is biased low by these removals.
+- **GPU gaps below δ ≈ 0.05.** These are biased low, because linear interpolation fails where Z is nearly parabolic (e.g. 0.0171 reported vs 0.0045 true for the closest pair found). Use `rh_pairs.py` values.
 
 ---
 
@@ -285,6 +283,33 @@ The GPU is now the bottleneck, so more workers only compete for it. Use `WORKERS
 ---
 
 ## Results
+
+### Nov 2026: zero statistics, t ∈ [3.00, 3.01]×10¹²
+
+100,000 chunks, **42,801,165,812 zeros**, 0 Backlund failures. About 42 minutes on 4 × RTX 5070 Ti (~39 chunks/s). Reproduce with `config.stats.example.json`, then `rh_stats.py` and `rh_pairs.py`.
+
+**Spacing distribution.** It deviates from the GUE (Gaudin) limit at hundreds of σ, in a stable pattern: too few gaps near s ≈ 0.25–0.5 and s ≈ 2–2.5, too many near s ≈ 1. The distribution is narrower than GUE. The finite-height model of Bogomolny, Bohigas, Leboeuf & Monastra (2006) treats the zeros as eigenvalues of a random unitary matrix of effective size N_eff = log(t/2π)/√(12Λ) = 6.19 (Λ ≈ 1.57314). That model explains most of the deviation:
+
+| | GUE limit | CUE(N_eff = 6.19) |
+|---|---|---|
+| Kolmogorov distance of spacing CDF | 3.28×10⁻³ | 1.13×10⁻³ |
+| χ² over 150 spacing bins (s < 3) | 13.9M | 7.4M |
+| Density at s = 0.10 (empirical 0.03827) | 0.03928 (−151σ) | 0.03828 (−1σ) |
+
+The model is near-exact for small gaps but leaves significant residuals in the tail (s ≳ 1.5). Freely fitting N gives N ≈ 7.8 rather than 6.19. With 4×10¹⁰ zeros, small effects show up at high σ: next-order corrections, and measurement effects such as dropped close pairs adding long gaps. So the residuals need modelling before they can be interpreted.
+
+**Pair correlation.** It deviates from Montgomery's 1 − (sin πx/πx)² in the same way at short range. CUE(N_eff) fixes x ≲ 0.5 but overshoots for x ≳ 1.5, where the data stay closer to Montgomery. That's consistent with N_eff being a nearest-neighbour model; long-range correlations carry the arithmetic (Bogomolny–Keating) corrections, which aren't implemented here.
+
+**Lehmer pairs.** 200 of the closest GPU candidates were checked with mpmath. 199 are genuine pairs, and 1 is a near-miss: Z dips to about −1×10⁻³ without crossing. The tightest pairs:
+
+| δ (unfolded) | gap in t | max \|Z\| between | t₁ |
+|---|---|---|---|
+| 0.00451 | 0.00105 | 1.5×10⁻⁵ | 3000265777242.715400332 |
+| 0.00561 | 0.00131 | 2.7×10⁻⁵ | 3000099793213.309308370 |
+| 0.00573 | 0.00134 | 3.0×10⁻⁵ | 3001414304717.801272679 |
+| 0.00720 | 0.00168 | 6.2×10⁻⁵ | 3003017360194.645113965 |
+
+The `dip_pairs` field was added after this run, so its 439,049 sub-2h pairs aren't recorded. Re-running the range would capture them.
 
 ### Oct 2026: sign-change count, t ∈ [3×10¹², 4×10¹²]
 

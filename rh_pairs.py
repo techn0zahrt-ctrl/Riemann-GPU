@@ -43,16 +43,24 @@ def check_pair(args):
     ta, tb, label = args
     mpmath.mp.dps = DPS
     ta, tb = mpmath.mpf(ta), mpmath.mpf(tb)
-    d = max(tb - ta, mpmath.mpf("0.002"))
+    # GPU positions of very close pairs can be off by a few 1e-3 (|Z| ~ GPU error there),
+    # so search at least ±0.005 around them.
+    d = max(tb - ta, mpmath.mpf("0.005"))
     lo, hi = ta - d, tb + d
-    m = 12
+    # ≥32 samples (step ≲ 5e-4 for the minimum window): the closest confirmed pairs are
+    # ~1e-3 apart in t, so a coarse grid can step over both zeros of a tight pair.
+    m = 32
     ts = [lo + (hi - lo) * k / m for k in range(m + 1)]
     zs = [Z(t) for t in ts]
     brackets = [(ts[k], ts[k + 1]) for k in range(m) if zs[k] * zs[k + 1] < 0]
     res = {"label": label, "t_a_scan": float(ta), "t_b_scan": float(tb),
-           "sign_changes": len(brackets)}
+           "sign_changes": len(brackets),
+           "min_abs_Z_sampled": float(min(abs(z) for z in zs))}
     if len(brackets) != 2:
-        res["status"] = "NOT_CONFIRMED"
+        # 0 sign changes with tiny |Z|: a near-miss the GPU (error up to ~2e-3) mistook
+        # for two zeros.  Not a counterexample: Z just dips close to zero without crossing.
+        res["status"] = ("NEAR_MISS" if not brackets and res["min_abs_Z_sampled"] < 5e-3
+                         else "NOT_CONFIRMED")
         return res
     # At t ~ 3e12 a 30-digit mpf leaves ~17 digits after the point; ask for 1e-12.
     try:
@@ -109,11 +117,11 @@ def main():
         rows = list(csv.DictReader(f))[: a.top]
     jobs = [(float(r["t_a"]), float(r["t_b"]), r["chunk_id"]) for r in rows]
     print(f"Checking {len(jobs)} pairs on {a.jobs} processes "
-          f"(~1–2 s per Z evaluation at t≈1e12, ~60 evaluations per pair)…", file=sys.stderr)
+          f"(~4 s per Z evaluation at t≈3e12, ~85 evaluations per pair)…", file=sys.stderr)
 
     out = a.out or a.csv.replace(".csv", "_confirmed.csv")
     fields = ["label", "status", "sign_changes", "t1", "t2", "gap", "unfolded_gap",
-              "max_abs_Z_between", "t_a_scan", "t_b_scan"]
+              "max_abs_Z_between", "min_abs_Z_sampled", "t_a_scan", "t_b_scan"]
     n_ok = 0
     with Pool(a.jobs) as pool, open(out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
