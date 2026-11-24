@@ -48,17 +48,14 @@ static inline double interp_zero_offset(const double* Z, int i, double h) {
     return (i + f) * h;
 }
 
-// idxs: accepted sign-change indices (sorted).  n: grid length.
-static ZeroStats compute_zero_stats(const double* Z, int n, double t0, double h,
-                                    const std::vector<int>& idxs,
-                                    long long dips_dropped, double close_thresh) {
+// g: zero offsets from the chunk start (sorted).  n: grid length.
+static ZeroStats compute_zero_stats_offsets(const std::vector<double>& g, int n,
+                                            double t0, double h,
+                                            long long dips_dropped, double close_thresh) {
     ZeroStats s;
     s.dips_dropped = dips_dropped;
-    const size_t nz = idxs.size();
+    const size_t nz = g.size();
     if (nz < 2) return s;
-
-    std::vector<double> g(nz);
-    for (size_t k = 0; k < nz; k++) g[k] = interp_zero_offset(Z, idxs[k], h);
 
     // Unfold with the density at the chunk midpoint.  Across a 1e5-wide chunk at
     // t ~ 1e12 the density changes by < 1e-8 relative, so one value is exact enough.
@@ -87,3 +84,13 @@ static ZeroStats compute_zero_stats(const double* Z, int n, double t0, double h,
     }
     return s;
 }
+
+// Convenience wrapper: idxs are accepted sign-change indices into the Z grid.
+static ZeroStats compute_zero_stats(const double* Z, int n, double t0, double h,
+                                    const std::vector<int>& idxs,
+                                    long long dips_dropped, double close_thresh) {
+    std::vector<double> g(idxs.size());
+    for (size_t k = 0; k < idxs.size(); k++) g[k] = interp_zero_offset(Z, idxs[k], h);
+    return compute_zero_stats_offsets(g, n, t0, h, dips_dropped, close_thresh);
+}
+

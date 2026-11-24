@@ -43,7 +43,7 @@ For t ~ 4×10¹², N ≈ 800,000 terms evaluated at K = 50,000,000 grid points. 
 
 The key insight from **Odlyzko & Schönhage (1988)** is that the main sum is a Fourier-type evaluation: each term n^{-it} = e^{-it ln n} places a source at non-uniform frequency ln(n)/(2π), and evaluating it at K equally-spaced t values is a **Non-Uniform DFT**. This reduces the cost from O(N·K) to O((N+K) log K).
 
-We implement this via the **NUFFT** (Kaiser-Bessel spreading → cuFFT → deconvolution), which is the standard modern realization of the Odlyzko-Schönhage idea. Each 100,000-second chunk runs in ~0.5 seconds on a single RTX 5070 Ti.
+We implement this via the **NUFFT** (Kaiser-Bessel spreading → cuFFT → deconvolution), which is the standard modern realization of the Odlyzko-Schönhage idea. Each 100,000-second chunk (50M Z-values) takes about 0.1 s on a single RTX 5070 Ti.
 
 ### Backlund verification (chunk-by-chunk)
 
@@ -192,7 +192,7 @@ nvcc -O3 -arch=sm_90 -o rh_worker_cuda rh_cuda.cu -lcufft -lpthread
 ```python
 # Add or remove IPs freely — any number of nodes works (1 to N)
 NODES            = ["192.168.1.10", "192.168.1.11", "192.168.1.12"]
-WORKERS_PER_NODE = 3      # parallel workers per node; tune to your GPU's VRAM (see table below)
+WORKERS_PER_NODE = 1      # workers per node; 1 is fastest on RTX 5070 Ti (see "Performance" below)
 WORK_DIR         = "/home/user/riemann-gpu"
 ```
 
@@ -220,7 +220,7 @@ This file controls what region of the critical line is searched. Create or edit 
 |---|---|---|
 | `T_start` | Lower bound of search (imaginary part of s) | 14.134 is the first known zero; start at 14 to cover everything |
 | `T_end` | Upper bound | Set to whatever height you want to reach |
-| `chunk_dt` | Width of each work unit in t-seconds | 100,000 is a good default (~0.5 sec/chunk on RTX 5070 Ti) |
+| `chunk_dt` | Width of each work unit in t-seconds | 100,000 is a good default (~0.1 s/chunk on RTX 5070 Ti) |
 
 The coordinator splits `[T_start, T_end]` into chunks of `chunk_dt` and distributes them across the cluster. It resumes automatically on restart — already-completed chunks are skipped.
 
@@ -261,12 +261,26 @@ For K = 50M samples per chunk (h = 0.002, chunk_dt = 100,000), the grid size is 
 | `d_grid_cx` | 2,147 MB | Complex NUFFT grid (spread target + FFT input) |
 | `d_Z_nufft` | 400 MB | Z(t) output per chunk |
 | `d_logn_corr` | 9 MB | log correction table (precision fix at large t) |
+| sign-change buffers | ~38 MB | GPU compaction output (indices + zero offsets) |
 | cuFFT workspace | ~2,147 MB | Internal FFT scratch |
 | **Total** | **~4.7 GB** | per worker |
 
-The grid is a single `cufftDoubleComplex*` — spreading writes directly into `.x` and `.y` via `atomicAdd`, eliminating the separate real/imaginary buffers that an earlier design used. This saves ~2 GB per worker and is the key optimization that allows 3 workers on a 16 GB GPU.
+The grid is a single `cufftDoubleComplex*` — spreading writes directly into `.x` and `.y` via `atomicAdd`, eliminating the separate real/imaginary buffers that an earlier design used. This saves about 2 GB per worker, which is what lets 3 workers fit on a 16 GB GPU if you ever need them.
 
-`WORKERS_PER_NODE` controls the tradeoff: more workers = more throughput (up to bandwidth saturation) but more VRAM. 3 workers fit comfortably on RTX 5070 Ti (16 GB), leaving ~750 MB headroom.
+## Performance
+
+Sign changes are found on the GPU. A count kernel runs first, then CUB `DeviceSelect` (ordered stream compaction), then a kernel that interpolates each zero's position. Only about 5 MB of indices and offsets come back to the host, not all 400 MB of Z. Before this change, each chunk spent about 0.18 s on the host: allocating a 400 MB array (0.09 s), copying Z back (0.04 s) and scanning for sign changes on one thread (0.05 s). Output is byte-identical to the old host path. `RH_HOST_SIGNS=1` forces the host path, which is also the automatic fallback.
+
+Measured on one RTX 5070 Ti (WSL2) at t ≈ 3.3×10¹², with stats on:
+
+| Binary | Workers/GPU | Chunks/s (steady state) |
+|---|---|---|
+| host sign detection (Oct 2026) | 3 | 6.55 |
+| GPU sign detection | **1** | **9.80** |
+| GPU sign detection | 2 | 8.09 |
+| GPU sign detection | 3 | 8.18 |
+
+The GPU is now the bottleneck, so more workers only compete for it. Use `WORKERS_PER_NODE = 1`. On 4 nodes that's about 39 chunks/s, roughly 1.4×10⁷ zeros per second.
 
 ---
 

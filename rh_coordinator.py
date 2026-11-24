@@ -28,7 +28,7 @@ NODES = [
     "192.168.100.11",
     "192.168.100.12",
 ]
-WORKERS_PER_NODE = 3
+WORKERS_PER_NODE = 1      # 1 is fastest since sign detection moved to the GPU (see README)
 WORK_DIR         = "/home/techno/math"
 STALE_TIMEOUT    = 7200
 MAX_INFLIGHT     = 20   # chunks streaming in-flight per slot before back-pressure

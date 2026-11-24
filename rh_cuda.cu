@@ -48,6 +48,9 @@
 
 #include "rh_stats.h"
 
+#include <cub/device/device_select.cuh>
+#include <thrust/iterator/counting_iterator.h>
+
 // ─── tunables ──────────────────────────────────────────────────────────────
 
 #define THREADS    256
@@ -357,7 +360,8 @@ static void ensure_nufft(int K, double h, int N_max) {
     }
 }
 
-// Compute Z[0..K-1] on a uniform grid t_j = t0 + j*h via NUFFT.
+// Compute Z[0..K-1] on a uniform grid t_j = t0 + j*h via NUFFT.  Z stays on the GPU in
+// d_Z_nufft; it is copied to Z_host (400 MB at K = 50M) only when Z_host != nullptr.
 static void compute_Z_nufft(
     double t0, double h, int K, double* Z_host)
 {
@@ -405,8 +409,9 @@ static void compute_Z_nufft(
     }
 
     cudaDeviceSynchronize();
-    cudaMemcpy(Z_host, d_Z_nufft, (size_t)K * sizeof(double),
-               cudaMemcpyDeviceToHost);
+    if (Z_host)
+        cudaMemcpy(Z_host, d_Z_nufft, (size_t)K * sizeof(double),
+                   cudaMemcpyDeviceToHost);
 
     // RH_DUMP=<file>: write tc, jc, h and Z at ~200 indices for validation (rh_check.py)
     if (const char* dump = getenv("RH_DUMP")) {
@@ -414,7 +419,9 @@ static void compute_Z_nufft(
             fprintf(f, "%.17g %d %.17g\n", tc, jc, h);
             for (int q = 0; q < 200; q++) {
                 int j = (int)((long long)q * (K - 1) / 199);
-                fprintf(f, "%d %.17g\n", j, Z_host[j]);
+                double zj;
+                cudaMemcpy(&zj, d_Z_nufft + j, sizeof(double), cudaMemcpyDeviceToHost);
+                fprintf(f, "%d %.17g\n", j, zj);
             }
             fclose(f);
         }
@@ -423,14 +430,115 @@ static void compute_Z_nufft(
 
 // ─── sign changes ──────────────────────────────────────────────────────────
 
-static std::vector<int> find_sign_changes(const double* Z, int n,
-                                          long long* dropped = nullptr) {
-    std::vector<int> raw;
-    raw.reserve(n / 4);
-    for (int i = 0; i < n - 1; i++)
-        if (Z[i] * Z[i+1] < 0.0 || Z[i] == 0.0)
-            raw.push_back(i);
+// Raw sign changes: indices i with Z[i]·Z[i+1] < 0 or Z[i] == 0, plus each zero's
+// offset from the chunk start by linear interpolation (see rh_stats.h).
+//
+// GPU path: count → CUB DeviceSelect (ordered stream compaction) → interpolate, then
+// copy back only ~K/115 indices and offsets (~5 MB) instead of all of Z (400 MB).
 
+struct SignChangePred {
+    const double* Z;
+    __device__ bool operator()(int i) const {
+        double a = Z[i], b = Z[i + 1];
+        return a * b < 0.0 || a == 0.0;
+    }
+};
+
+__global__ void sign_count_kernel(const double* __restrict__ Z, int n_items,
+                                  unsigned long long* __restrict__ count) {
+    int i = (int)(blockIdx.x * (unsigned)blockDim.x + threadIdx.x);
+    bool f = false;
+    if (i < n_items) { double a = Z[i], b = Z[i + 1]; f = (a * b < 0.0 || a == 0.0); }
+    int c = __syncthreads_count(f);
+    if (threadIdx.x == 0 && c) atomicAdd(count, (unsigned long long)c);
+}
+
+__global__ void interp_offset_kernel(const double* __restrict__ Z,
+                                     const int* __restrict__ idx, int n, double h,
+                                     double* __restrict__ off) {
+    int k = (int)(blockIdx.x * (unsigned)blockDim.x + threadIdx.x);
+    if (k >= n) return;
+    int i = idx[k];
+    double a = Z[i], b = Z[i + 1];
+    double f = (a == b) ? 0.5 : a / (a - b);
+    if (f < 0.0) f = 0.0; else if (f > 1.0) f = 1.0;
+    off[k] = (i + f) * h;          // same formula as interp_zero_offset()
+}
+
+static int*                d_sc_idx  = nullptr;
+static double*             d_sc_off  = nullptr;
+static int*                d_sc_nsel = nullptr;
+static unsigned long long* d_sc_cnt  = nullptr;
+static void*               d_cub_tmp = nullptr;
+static size_t              cub_tmp_bytes = 0;
+static int                 sc_cap    = 0;
+
+// Returns false (caller falls back to the host path) if the count exceeds the
+// preallocated capacity or a CUDA call fails.
+static bool gpu_sign_changes(int K, double h, std::vector<int>& raw, std::vector<double>& off) {
+    const int n_items = K - 1;
+    if (!d_sc_cnt) {
+        // ~430k zeros per 50M-point chunk; K/16 leaves >7x headroom for noisy chunks.
+        sc_cap = K / 16;
+        if (cudaMalloc(&d_sc_idx,  (size_t)sc_cap * sizeof(int))    != cudaSuccess ||
+            cudaMalloc(&d_sc_off,  (size_t)sc_cap * sizeof(double)) != cudaSuccess ||
+            cudaMalloc(&d_sc_nsel, sizeof(int))                     != cudaSuccess ||
+            cudaMalloc(&d_sc_cnt,  sizeof(unsigned long long))      != cudaSuccess) {
+            fprintf(stderr, "[signs] OOM allocating compaction buffers\n");
+            d_sc_cnt = nullptr; return false;
+        }
+        cub::DeviceSelect::If(nullptr, cub_tmp_bytes, thrust::counting_iterator<int>(0),
+                              d_sc_idx, d_sc_nsel, n_items, SignChangePred{d_Z_nufft});
+        if (cudaMalloc(&d_cub_tmp, cub_tmp_bytes) != cudaSuccess) {
+            fprintf(stderr, "[signs] OOM allocating CUB temp (%zu B)\n", cub_tmp_bytes);
+            return false;
+        }
+        fprintf(stderr, "[signs] GPU compaction cap=%d tmp=%.1f MB\n", sc_cap, cub_tmp_bytes / 1e6);
+    }
+    if (n_items <= 0) { raw.clear(); off.clear(); return true; }
+
+    // 1. count, so the compaction can never overrun the buffers
+    cudaMemset(d_sc_cnt, 0, sizeof(unsigned long long));
+    sign_count_kernel<<<(n_items + THREADS - 1) / THREADS, THREADS>>>(d_Z_nufft, n_items, d_sc_cnt);
+    unsigned long long cnt = 0;
+    cudaMemcpy(&cnt, d_sc_cnt, sizeof(cnt), cudaMemcpyDeviceToHost);
+    if (cnt > (unsigned long long)sc_cap) {
+        fprintf(stderr, "[signs] %llu sign changes > cap %d, host fallback\n", cnt, sc_cap);
+        return false;
+    }
+
+    // 2. ordered compaction of indices, 3. interpolated offsets
+    size_t tmp = cub_tmp_bytes;
+    cub::DeviceSelect::If(d_cub_tmp, tmp, thrust::counting_iterator<int>(0),
+                          d_sc_idx, d_sc_nsel, n_items, SignChangePred{d_Z_nufft});
+    int n = (int)cnt;
+    if (n > 0)
+        interp_offset_kernel<<<(n + THREADS - 1) / THREADS, THREADS>>>(d_Z_nufft, d_sc_idx, n, h, d_sc_off);
+
+    raw.resize(n); off.resize(n);
+    if (n > 0) {
+        cudaMemcpy(raw.data(), d_sc_idx, (size_t)n * sizeof(int),    cudaMemcpyDeviceToHost);
+        cudaMemcpy(off.data(), d_sc_off, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost);
+    }
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { fprintf(stderr, "[signs] CUDA error: %s\n", cudaGetErrorString(e)); return false; }
+    return true;
+}
+
+static void host_sign_changes(const double* Z, int n, double h,
+                              std::vector<int>& raw, std::vector<double>& off) {
+    raw.clear(); off.clear();
+    raw.reserve(n / 64); off.reserve(n / 64);
+    for (int i = 0; i < n - 1; i++)
+        if (Z[i] * Z[i+1] < 0.0 || Z[i] == 0.0) {
+            raw.push_back(i);
+            off.push_back(interp_zero_offset(Z, i, h));
+        }
+}
+
+// Returns positions (into raw) of the sign changes kept after dip filtering.
+static std::vector<size_t> filter_dips(const std::vector<int>& raw,
+                                       long long* dropped = nullptr) {
     // Remove narrow sign-change pairs caused by numerical false dips.
     // A near-miss Z minimum (Z_true ≈ |ε| ≈ 0.005) at t_j can push Z_NUFFT
     // below zero for 1-2 grid steps, creating sign changes at (j-1,j) and
@@ -445,7 +553,7 @@ static std::vector<int> find_sign_changes(const double* Z, int n,
     // genuine close-pair zeros per 5000s interval — a net of ~+600 → ~+10.
     static const int GAP_MAX = 2;
 
-    std::vector<int> out;
+    std::vector<size_t> out;
     out.reserve(raw.size());
     long long nd = 0;
     for (size_t k = 0; k < raw.size(); ) {
@@ -453,7 +561,7 @@ static std::vector<int> find_sign_changes(const double* Z, int n,
             k += 2;  // skip pair → false dip
             nd++;
         } else {
-            out.push_back(raw[k]);
+            out.push_back(k);
             ++k;
         }
     }
@@ -550,10 +658,13 @@ static ChunkResult compute_chunk(const std::string& job) {
     if (K > 52000000) K = 52000000;
     double t0  = t_start;
 
-    std::vector<double> Zg(K);
+    // The full Z array is only needed on the host for the RH_DIAG diagnostics.
+    const bool diag = getenv("RH_DIAG") != nullptr;
+    std::vector<double> Zg;
+    if (diag) Zg.resize(K);
 
     double t0scan = now_s();
-    compute_Z_nufft(t0, h, K, Zg.data());
+    compute_Z_nufft(t0, h, K, diag ? Zg.data() : nullptr);
     double scan_s = now_s() - t0scan;
     fprintf(stderr,"  scan %.3fs  K=%d  pts/s=%.0f\n",
             scan_s, K, K/(scan_s+1e-9));
@@ -727,8 +838,21 @@ static ChunkResult compute_chunk(const std::string& job) {
     }
 
     // Count sign changes (positions only needed on Backlund mismatch)
+    std::vector<int>    raw;
+    std::vector<double> raw_off;
+    // RH_HOST_SIGNS=1 forces the host path (for testing the fallback).
+    if (getenv("RH_HOST_SIGNS") || !gpu_sign_changes(K, h, raw, raw_off)) {
+        if (Zg.empty()) {
+            Zg.resize(K);
+            cudaMemcpy(Zg.data(), d_Z_nufft, (size_t)K * sizeof(double), cudaMemcpyDeviceToHost);
+        }
+        host_sign_changes(Zg.data(), K, h, raw, raw_off);
+    }
     long long n_dips = 0;
-    auto idxs = find_sign_changes(Zg.data(), K, &n_dips);
+    std::vector<size_t> keep = filter_dips(raw, &n_dips);
+    std::vector<int>    idxs(keep.size());
+    std::vector<double> offs(keep.size());
+    for (size_t k = 0; k < keep.size(); k++) { idxs[k] = raw[keep[k]]; offs[k] = raw_off[keep[k]]; }
     long long nf = (long long)idxs.size();
 
     fprintf(stderr,"  zeros=%lld  (pos acc=%.4f)\n", nf, h/2.0);
@@ -758,7 +882,7 @@ static ChunkResult compute_chunk(const std::string& job) {
     if (r.want_stats) {
         double ct = jdbl(job, "close_thresh");
         if (ct <= 0.0) ct = 0.05;
-        r.stats = compute_zero_stats(Zg.data(), K, t0, h, idxs, n_dips, ct);
+        r.stats = compute_zero_stats_offsets(offs, K, t0, h, n_dips, ct);
     }
     r.wall_seconds      = now_s() - t_wall;
     if (!ok) {
